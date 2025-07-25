@@ -124,8 +124,11 @@ public class DataMigrationServiceImpl implements DataMigrationService {
         userInfo.put("userRoles", roles);
 
         String profileDetailsJson = (String) userInfo.get("profiledetails");
-        if (StringUtils.isNotEmpty(profileDetailsJson)) {
-            String designation = extractDesignation(profileDetailsJson, mapper, userId);
+        if (CollectionUtils.isNotEmpty(roles)) {
+            String designation = null;
+            if (StringUtils.isNotEmpty(profileDetailsJson)) {
+                designation = extractDesignation(profileDetailsJson, mapper, userId);
+            }
             if (CollectionUtils.isNotEmpty(roles)) {
                 logger.info("Updating Neo4j for userId: {}, rootOrgId: {}, designation: {}, roles: {}", userId, rootOrgId, designation, roles);
                 updateNeo4jUser(tx, userId, rootOrgId, designation, roles);
