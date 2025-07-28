@@ -9,21 +9,20 @@ import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.neo4j.driver.v1.Driver;
 import org.neo4j.driver.v1.Session;
-import org.neo4j.driver.v1.StatementResult;
 import org.neo4j.driver.v1.Transaction;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
+import com.opencsv.CSVReader;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.util.*;
+import java.util.concurrent.*;
 import java.util.stream.Collectors;
-import com.opencsv.CSVReader;
-
 
 @Service
 public class DataMigrationServiceImpl implements DataMigrationService {
@@ -36,19 +35,121 @@ public class DataMigrationServiceImpl implements DataMigrationService {
     @Autowired
     private CassandraOperation cassandraOperation;
 
+    private static final int BATCH_SIZE = 4000;
+    private static final int THREAD_POOL_SIZE = 10; 
+
     @Override
     public Response onBoardNewUsers(MultipartFile file) {
         List<List<String>> userIdBatches = null;
         try {
-            userIdBatches = streamUserIdsInBatches(file, 1000);
+            userIdBatches = streamUserIdsInBatches(file, BATCH_SIZE);
         } catch (Exception e) {
             logger.error("Error reading user IDs from file: {}", e.getMessage(), e);
+            return null;
         }
-        for (List<String> userIds : userIdBatches) {
-            processUserBatch(userIds);
-            System.out.println("Processed batch of user IDs: " + userIds.size());
-        }
+        ExecutorService executor = Executors.newFixedThreadPool(THREAD_POOL_SIZE);
+        List<CompletableFuture<Void>> futures = userIdBatches.stream()
+                .map(userIds -> CompletableFuture.runAsync(() -> processUserBatchOptimized(userIds), executor))
+                .collect(Collectors.toList());
+        futures.forEach(CompletableFuture::join);
+        executor.shutdown();
+        logger.info("All batches processed.");
         return null;
+    }
+
+    public void processUserBatchOptimized(List<String> userIds) {
+        logger.info("Starting processing batch of {} user IDs", userIds.size());
+        List<Map<String, Object>> userInfoList = fetchUserInfo(userIds);
+        Map<String, List<String>> userIdToRoles = fetchUserRoles(userIds);
+        List<Map<String, Object>> neo4jUpdates = buildNeo4jUpdates(userInfoList, userIdToRoles);
+        bulkUpdateNeo4j(neo4jUpdates);
+        logger.info("Finished processing batch of {} user IDs", userIds.size());
+    }
+
+    private List<Map<String, Object>> fetchUserInfo(List<String> userIds) {
+        Map<String, Object> propertyMap = new HashMap<>();
+        propertyMap.put(Constants.ID, userIds);
+        return cassandraOperation.getRecordsByProperties(
+                Constants.KEYSPACE_SUNBIRD, Constants.TABLE_USER, propertyMap,
+                Arrays.asList("id", "rootorgid", "profiledetails", "roles")
+        );
+    }
+
+    private Map<String, List<String>> fetchUserRoles(List<String> userIds) {
+        Map<String, Object> roleQueryMap = new HashMap<>();
+        roleQueryMap.put("userid", userIds);
+        List<Map<String, Object>> allRoles = cassandraOperation.getRecordsByProperties(
+                Constants.KEYSPACE_SUNBIRD, "user_roles", roleQueryMap,
+                Arrays.asList("userid", "role", "scope")
+        );
+        ObjectMapper mapper = new ObjectMapper();
+        Map<String, List<String>> userIdToRoles = new HashMap<>();
+        for (Map<String, Object> roleRecord : allRoles) {
+            String userId = (String) roleRecord.get("userid");
+            String role = (String) roleRecord.get("role");
+            Object scopeObj = roleRecord.get("scope");
+            try {
+                if (scopeObj instanceof String && !((String) scopeObj).trim().isEmpty()) {
+                    mapper.readValue((String) scopeObj, new TypeReference<List<Map<String, Object>>>() {});
+                }
+            } catch (Exception e) {
+                logger.warn("Failed to parse scope JSON for userId {}: {}", userId, e.getMessage());
+                continue;
+            }
+            userIdToRoles.computeIfAbsent(userId, k -> new ArrayList<>()).add(role);
+        }
+        return userIdToRoles;
+    }
+
+    private List<Map<String, Object>> buildNeo4jUpdates(List<Map<String, Object>> userInfoList, Map<String, List<String>> userIdToRoles) {
+        ObjectMapper mapper = new ObjectMapper();
+        List<Map<String, Object>> neo4jUpdates = new ArrayList<>();
+        for (Map<String, Object> userInfo : userInfoList) {
+            String userId = (String) userInfo.get("id");
+            String rootOrgId = (String) userInfo.get("rootorgid");
+            List<String> roles = userIdToRoles.getOrDefault(userId, Collections.emptyList());
+            boolean missingIdOrOrg = StringUtils.isEmpty(userId) || StringUtils.isEmpty(rootOrgId);
+            boolean missingRoles = CollectionUtils.isEmpty(roles);
+            if (missingIdOrOrg || missingRoles) {
+                if (missingIdOrOrg) {
+                    logger.warn("User is missing ID or rootOrgId: {}", userInfo);
+                }
+                if (!missingIdOrOrg && missingRoles) {
+                    logger.warn("Skipping user {} due to missing roles", userId);
+                }
+                continue;
+            }
+            String profileDetailsJson = (String) userInfo.get("profiledetails");
+            String designation = null;
+            if (StringUtils.isNotEmpty(profileDetailsJson)) {
+                designation = extractDesignation(profileDetailsJson, mapper, userId);
+            }
+            Map<String, Object> updateObj = new HashMap<>();
+            updateObj.put("userId", userId);
+            updateObj.put("organisationId", rootOrgId);
+            updateObj.put("designation", designation);
+            updateObj.put("role", roles);
+            neo4jUpdates.add(updateObj);
+        }
+        return neo4jUpdates;
+    }
+
+    private void bulkUpdateNeo4j(List<Map<String, Object>> neo4jUpdates) {
+        if (neo4jUpdates.isEmpty()) return;
+        try (Session session = neo4jDriver.session(); Transaction tx = session.beginTransaction()) {
+            String query = "UNWIND $users AS user " +
+                    "MERGE (u:userV3_testing {userId: user.userId}) " +
+                    "SET u.organisationId = user.organisationId, " +
+                    "u.designation = user.designation, " +
+                    "u.role = user.role";
+            Map<String, Object> params = new HashMap<>();
+            params.put("users", neo4jUpdates);
+            tx.run(query, params);
+            tx.success();
+            logger.info("Bulk updated {} users in Neo4j", neo4jUpdates.size());
+        } catch (Exception e) {
+            logger.error("Neo4j session error: {}", e.getMessage());
+        }
     }
 
     public List<List<String>> streamUserIdsInBatches(MultipartFile file, int batchSize) throws Exception {
@@ -85,59 +186,6 @@ public class DataMigrationServiceImpl implements DataMigrationService {
         return batches;
     }
 
-    public void processUserBatch(List<String> userIds) {
-        logger.info("Starting processing batch of {} user IDs", userIds.size());
-        Map<String, Object> propertyMap = new HashMap<>();
-        propertyMap.put(Constants.ID, userIds);
-
-        logger.info("Fetching user info from Cassandra for user IDs: {}", userIds);
-        List<Map<String, Object>> userInfoList = cassandraOperation.getRecordsByProperties(
-                Constants.KEYSPACE_SUNBIRD, Constants.TABLE_USER, propertyMap,
-                Arrays.asList("id", "rootorgid", "profiledetails", "roles")
-        );
-        logger.info("Fetched {} user records from Cassandra", userInfoList.size());
-
-        ObjectMapper mapper = new ObjectMapper();
-
-        try (Session session = neo4jDriver.session(); Transaction tx = session.beginTransaction()) {
-            for (Map<String, Object> userInfo : userInfoList) {
-                logger.debug("Processing user info: {}", userInfo);
-                handleUserInfo(userInfo, mapper, tx);
-            }
-            tx.success();
-            logger.info("Committed Neo4j transaction for batch of {} users", userInfoList.size());
-        } catch (Exception e) {
-            logger.error("Neo4j session error: {}", e.getMessage());
-        }
-        logger.info("Finished processing batch of {} user IDs", userIds.size());
-    }
-
-    private void handleUserInfo(Map<String, Object> userInfo, ObjectMapper mapper, Transaction tx) {
-        String userId = (String) userInfo.get("id");
-        String rootOrgId = (String) userInfo.get("rootorgid");
-        if (StringUtils.isEmpty(userId) || StringUtils.isEmpty(rootOrgId)) {
-            logger.warn("User is missing ID or rootOrgId: {}", userInfo);
-            return;
-        }
-        logger.debug("Fetching roles for userId: {}, rootOrgId: {}", userId, rootOrgId);
-        List<String> roles = getUserRoles(userId, rootOrgId);
-        userInfo.put("userRoles", roles);
-
-        String profileDetailsJson = (String) userInfo.get("profiledetails");
-        if (CollectionUtils.isNotEmpty(roles)) {
-            String designation = null;
-            if (StringUtils.isNotEmpty(profileDetailsJson)) {
-                designation = extractDesignation(profileDetailsJson, mapper, userId);
-            }
-            if (CollectionUtils.isNotEmpty(roles)) {
-                logger.info("Updating Neo4j for userId: {}, rootOrgId: {}, designation: {}, roles: {}", userId, rootOrgId, designation, roles);
-                updateNeo4jUser(tx, userId, rootOrgId, designation, roles);
-            } else {
-                logger.warn("Skipping user {} due to missing required fields", userId);
-            }
-        }
-    }
-
     private String extractDesignation(String profileDetailsJson, ObjectMapper mapper, String userId) {
         try {
             Map<String, Object> userProfileDetailsMap = mapper.readValue(
@@ -154,62 +202,12 @@ public class DataMigrationServiceImpl implements DataMigrationService {
         return null;
     }
 
-    private void updateNeo4jUser(Transaction tx, String userId, String rootOrgId, String designation, List<String> roles) {
-        Map<String, Object> parameters = new HashMap<>();
-        parameters.put("userId", userId);
-        parameters.put("organisationId", rootOrgId);
-        parameters.put("designation", designation);
-        parameters.put("role", roles);
-
-        String query = "MERGE (u:userV3 {userId: $userId}) " +
-                "SET u.organisationId = $organisationId, " +
-                "u.designation = $designation, " +
-                "u.role = $role " +
-                "RETURN u.userId";
-        logger.debug("Running Neo4j query for userId: {}", userId);
-        StatementResult result = tx.run(query, parameters);
-        if (result.hasNext()) {
-            logger.info("Added/Updated user {} to Neo4j with label userV3", result.next().get(0).asString());
-        } else {
-            logger.warn("No result returned for user {} in Neo4j update", userId);
-        }
-    }
-
-    public List<String> getUserRoles(String userId, String rootOrgId) {
-        Map<String, Object> paramMaps = new HashMap<>();
-        paramMaps.put("userid", userId);
-        ObjectMapper mapper = new ObjectMapper();
-        List<Map<String, Object>> records = cassandraOperation.getRecordsByProperties(Constants.KEYSPACE_SUNBIRD, "user_roles", paramMaps, Arrays.asList("role", "scope"));
-        return records.stream().map(record -> {
-            Object scopeObj = record.get("scope");
-            List<Map<String, Object>> scopes = new ArrayList<>();
-            if (scopeObj instanceof List) {
-                scopes = (List<Map<String, Object>>) scopeObj;
-            } else if (scopeObj instanceof String) {
-                String scopeStr = (String) scopeObj;
-                if (!scopeStr.trim().isEmpty()) {
-                    try {
-                        // Use Jackson's TypeReference
-                        scopes = mapper.readValue(scopeStr, new TypeReference<List<Map<String, Object>>>() {
-                        });
-                    } catch (Exception e) {
-                        logger.warn("Failed to parse scope JSON for userId {}: {}", userId, e.getMessage());
-                        return null;
-                    }
-                }
-            }
-            if (!scopes.isEmpty() && scopes.stream().allMatch(scope -> rootOrgId.equals(scope.get(Constants.ORGANISATION_ID)))) {
-                return (String) record.get("role");
-            }
-            return null;
-        }).filter(Objects::nonNull).distinct().collect(Collectors.toList());
-    }
 
     @Override
     public Response updateRelaionsUsers(MultipartFile file) {
         List<List<List<String>>> userIdBatches = null;
         try {
-            userIdBatches = streamUserRelationsInBatches(file, 1000);
+            userIdBatches = streamUserRelationsInBatches(file, BATCH_SIZE);
         }catch (Exception e) {
             logger.error("Error reading user relations from file: {}", e.getMessage(), e);
         }
@@ -249,7 +247,6 @@ public class DataMigrationServiceImpl implements DataMigrationService {
         }
         return batches;
     }
-
 
     public void processUserRelationsBatches(List<List<List<String>>> userIdBatches, Transaction tx) throws Exception {
         ObjectMapper mapper = new ObjectMapper();
