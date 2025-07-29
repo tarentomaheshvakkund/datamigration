@@ -190,9 +190,19 @@ public class DataMigrationServiceImpl implements DataMigrationService {
         try {
             Map<String, Object> userProfileDetailsMap = mapper.readValue(
                     profileDetailsJson, new TypeReference<Map<String, Object>>() {});
-            List<Map<String, Object>> professionDetails = (List<Map<String, Object>>) userProfileDetailsMap.get("professionalDetails");
-            if (!CollectionUtils.isEmpty(professionDetails)) {
-                Map<String, Object> professionDetailsMap = professionDetails.get(0);
+            Object professionDetailsObj = userProfileDetailsMap.get("professionalDetails");
+            if (professionDetailsObj instanceof List) {
+                List<?> professionDetails = (List<?>) professionDetailsObj;
+                if (!CollectionUtils.isEmpty(professionDetails)) {
+                    Object first = professionDetails.get(0);
+                    if (first instanceof Map) {
+                        Map<?, ?> professionDetailsMap = (Map<?, ?>) first;
+                        logger.debug("Extracted designation for user {}: {}", userId, professionDetailsMap.get("designation"));
+                        return (String) professionDetailsMap.get("designation");
+                    }
+                }
+            } else if (professionDetailsObj instanceof Map) {
+                Map<?, ?> professionDetailsMap = (Map<?, ?>) professionDetailsObj;
                 logger.debug("Extracted designation for user {}: {}", userId, professionDetailsMap.get("designation"));
                 return (String) professionDetailsMap.get("designation");
             }
