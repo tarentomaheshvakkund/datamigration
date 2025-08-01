@@ -138,7 +138,7 @@ public class DataMigrationServiceImpl implements DataMigrationService {
         if (neo4jUpdates.isEmpty()) return;
         try (Session session = neo4jDriver.session(); Transaction tx = session.beginTransaction()) {
             String query = "UNWIND $users AS user " +
-                    "MERGE (u:userV3_testing {userId: user.userId}) " +
+                    "MERGE (u:userV3 {userId: user.userId}) " +
                     "SET u.organisationId = user.organisationId, " +
                     "u.designation = user.designation, " +
                     "u.role = user.role";
